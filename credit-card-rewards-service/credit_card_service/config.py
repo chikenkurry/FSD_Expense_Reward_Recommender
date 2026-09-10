@@ -65,6 +65,14 @@ def load_config(path: str) -> dict:
     for item in data["sources"]:
         if not isinstance(item, dict):
             raise ConfigError("every source must be an object")
+        is_dir = item.get("is_directory", False)
+        if not isinstance(is_dir, bool):
+            raise ConfigError("is_directory must be a boolean when supplied")
+
+        # card_id can default to source_id if this source is an auto-discovery directory
+        if is_dir and "card_id" not in item:
+            item["card_id"] = item.get("source_id", "")
+
         required = ("source_id", "issuer", "name", "card_id", "page_url", "enabled")
         if any(not isinstance(item.get(key), str) or not item[key].strip() for key in required[:-1]) or not isinstance(item.get("enabled"), bool):
             raise ConfigError("source requires nonempty source_id, issuer, name, card_id, page_url and boolean enabled")
@@ -83,8 +91,10 @@ def load_config(path: str) -> dict:
         delay = item.get("request_delay_seconds", 0)
         if isinstance(delay, bool) or not isinstance(delay, (int, float)) or delay < 0 or delay > 60:
             raise ConfigError("request_delay_seconds must be a number from 0 to 60")
+        if "link_pattern" in item:
+            _valid_regex(item["link_pattern"], "link_pattern")
         hints = _validate_hints(item.get("extraction_hints", {}))
-        sources.append({**item, "request_delay_seconds": delay, "extraction_hints": hints})
+        sources.append({**item, "request_delay_seconds": delay, "extraction_hints": hints, "is_directory": is_dir})
     return {"version": 1, "sources": sources}
 
 

@@ -33,6 +33,8 @@ class FixtureHandler(BaseHTTPRequestHandler):
             body, typ = b"User-agent: *\nAllow: /\n", "text/plain"
         elif self.path == "/card":
             body, typ = FIXTURE, "text/html; charset=utf-8"
+        elif self.path == "/directory":
+            body, typ = b'<html><body><a href="/card">Synthetic Card</a><a href="/faq">FAQ</a></body></html>', "text/html; charset=utf-8"
         elif self.path == "/large":
             body, typ = b"x" * 1_000_001, "text/html"
         elif self.path == "/json":
@@ -212,3 +214,21 @@ class ServiceTests(unittest.TestCase):
 
     def test_only_configured_sources_selected(self):
         with self.assertRaises(Exception): selected_sources({"sources": [self.source]}, ["not-configured"])
+
+    def test_directory_crawler_discovery_and_scrape(self):
+        dir_source = {
+            "source_id": "synthetic-dir",
+            "issuer": "Synthetic Bank",
+            "name": "Synthetic Bank Directory",
+            "card_id": "synthetic-hub",
+            "page_url": self.base + "/directory",
+            "is_directory": True,
+            "link_pattern": "/card$",
+            "enabled": True,
+            "request_delay_seconds": 0,
+            "extraction_hints": {},
+        }
+        res = Scraper(allow_private_hosts=True).scrape_source(dir_source, self.db_path)
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(res["discovered_count"], 1)
+        self.assertIn("synthetic-hub-card", res["cards_scraped"])

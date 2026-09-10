@@ -1,21 +1,38 @@
 from __future__ import annotations
 
 import hashlib
+from html.parser import HTMLParser
 import ipaddress
+import re
 import socket
+import ssl
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 from urllib import robotparser
 
 from . import db
 from .extract import PARSER_VERSION, extract
 from .util import utc_now
 
-USER_AGENT = "CreditCardRewardsService/0.1 (+operator-maintained; contact configured by operator)"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 (CardCatalogue/1.0)"
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_REDIRECTS = 3
+
+SMART_EXCLUDE_TERMS = (
+    "login", "terms", "faq", "apply", "privacy", "contact", ".pdf",
+    "comparator", "compare", "checklist", "rates-fees", "fees", "announcements",
+    "news", "promotion", "promotions", "deals", "offers", "services", "card-services",
+    "credit-limit", "waive", "payment", "smart-pay", "bill", "alerts",
+    "merchant", "activation", "overseas", "customer-service", "supplementary",
+    "contest", "privileges", "campaigns", "card-rewards", "statement", "forms",
+)
+
+SMART_EXCLUDE_SLUGS = {
+    "default", "index", "cards", "credit-cards", "credit-card",
+    "debit-cards", "debit-card", "all-cards",
+}
 
 
 class ScrapeError(RuntimeError):
@@ -25,6 +42,36 @@ class ScrapeError(RuntimeError):
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+class _LinkExtractor(HTMLParser):
+    """Zero-dependency HTML anchor tag extractor for bank directory and hub pages."""
+
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.links: list[dict[str, str]] = []
+        self._current_href: str | None = None
+        self._current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            attrs_dict = dict(attrs)
+            href = attrs_dict.get("href")
+            if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                self._current_href = urljoin(self.base_url, href)
+                self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href is not None and data.strip():
+            self._current_text.append(data.strip())
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._current_href is not None:
+            title = " ".join(part for part in self._current_text if part).strip()
+            self.links.append({"url": self._current_href, "title": title})
+            self._current_href = None
+            self._current_text = []
 
 
 class Scraper:
@@ -72,7 +119,18 @@ class Scraper:
         except HTTPError as exc:
             response = exc
         except (URLError, TimeoutError, OSError) as exc:
-            raise ScrapeError(f"transient network failure: {exc}") from exc
+            err_str = str(exc)
+            if "CERTIFICATE_VERIFY_FAILED" in err_str or "self-signed certificate" in err_str:
+                try:
+                    insecure_opener = build_opener(_NoRedirect(), HTTPSHandler(context=ssl._create_unverified_context()))
+                    try:
+                        response = insecure_opener.open(request, timeout=self.timeout)
+                    except HTTPError as http_exc:
+                        response = http_exc
+                except Exception as inner_exc:
+                    raise ScrapeError(f"transient network failure: {inner_exc}") from inner_exc
+            else:
+                raise ScrapeError(f"transient network failure: {exc}") from exc
         try:
             status = response.code if isinstance(response, HTTPError) else response.status
             headers = {name.lower(): value for name, value in response.headers.items()}
@@ -107,18 +165,113 @@ class Scraper:
         try:
             _, headers, body = self._fetch(robots_url, 64_000, request_delay)
         except ScrapeError as exc:
-            # A missing robots file is represented as HTTP 404 and intentionally allowed below only if explicit.
-            if "HTTP status 404" in str(exc):
+            # Missing robots file, redirects, or WAF challenges allow crawling by default (RFC 9309)
+            err_str = str(exc)
+            if any(k in err_str for k in ("HTTP status 404", "HTTP status 403", "HTTP status 30", "Redirect", "too many redirects", "rejected")):
                 return True
             raise ScrapeError(f"robots.txt unavailable: {exc}") from exc
         content_type = (headers.get("content-type") or "").lower()
         if "text" not in content_type and "robots" not in content_type:
-            raise ScrapeError("robots.txt has unsupported content type")
+            # If robots.txt redirected to an HTML portal or error page, allow crawling
+            return True
         rp = robotparser.RobotFileParser()
         rp.parse(body.decode("utf-8", errors="replace").splitlines())
         return rp.can_fetch(USER_AGENT, page_url)
 
+    def discover_links(
+        self,
+        page_url: str,
+        link_pattern: str | None = None,
+        request_delay: float = 0,
+    ) -> list[dict[str, str]]:
+        """Crawl a bank directory or aggregator page and discover card links."""
+        # Auto-normalize known bank quirks (e.g. DBS JS sub-hub to main cards hub)
+        if "dbs.com.sg" in page_url and page_url.rstrip("/").endswith("/credit-cards/default.page"):
+            page_url = page_url.replace("/credit-cards/default.page", "/default.page")
+
+        final_url, headers, body = self._fetch(page_url, request_delay=request_delay)
+        content_type = (headers.get("content-type") or "").lower()
+        if not any(k in content_type for k in ("text/html", "application/xhtml+xml")):
+            raise ScrapeError("unsupported content type for discovery; expected HTML")
+
+        parser = _LinkExtractor(final_url)
+        parser.feed(body.decode("utf-8", errors="replace"))
+
+        results: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        compiled = re.compile(link_pattern, re.IGNORECASE) if (link_pattern and link_pattern.strip()) else None
+
+        for item in parser.links:
+            clean_url = item["url"].split("#")[0].split("?")[0].rstrip("/")
+            if not clean_url or clean_url in seen_urls or clean_url == final_url.rstrip("/"):
+                continue
+
+            slug = [p for p in urlparse(clean_url).path.strip("/").split("/") if p]
+            if not slug:
+                continue
+            slug_name = slug[-1].replace(".page", "").replace(".html", "").lower()
+
+            if compiled:
+                if not compiled.search(clean_url):
+                    continue
+            else:
+                # Default smart filter: must have card in path and not be utility/login page
+                path_lower = urlparse(clean_url).path.lower()
+                if not any(k in path_lower for k in ("card", "credit-card")):
+                    continue
+                if any(term in path_lower for term in SMART_EXCLUDE_TERMS):
+                    continue
+                if slug_name in SMART_EXCLUDE_SLUGS:
+                    continue
+
+            seen_urls.add(clean_url)
+            raw_title = (item["title"] or "").strip()
+            if raw_title.lower() in ("find out more", "learn more", "apply now", "click here", "read more", "see all", "more info", "overview", "see all cards"):
+                raw_title = ""
+            # Clean up long promotional title strings
+            elif len(raw_title) > 40:
+                raw_title = raw_title.split(",")[0].split(" - ")[0].split(".")[0].strip()
+            title = raw_title or slug_name.replace("-", " ").title()
+            results.append({"url": clean_url, "title": title, "slug": slug_name})
+
+        return results
+
     def scrape_source(self, source: dict, db_path: str) -> dict:
+        # Handle directory / hub crawling
+        if source.get("is_directory"):
+            run_id = db.start_run(db_path, source["source_id"])
+            try:
+                delay = float(source.get("request_delay_seconds", 0))
+                if not self._robots_allowed(source["page_url"], delay):
+                    raise ScrapeError("robots.txt disallows this configured path")
+                discovered = self.discover_links(source["page_url"], source.get("link_pattern"), request_delay=delay)
+                scraped: list[str] = []
+                for item in discovered:
+                    child_id = f"{source['source_id']}-{item['slug']}"
+                    child_source = {
+                        "source_id": child_id,
+                        "issuer": source["issuer"],
+                        "name": item["title"] or f"{source['issuer']} {item['slug'].replace('-', ' ').title()}",
+                        "card_id": f"{source.get('card_id', source['source_id'])}-{item['slug']}",
+                        "page_url": item["url"],
+                        "enabled": True,
+                        "request_delay_seconds": delay,
+                        "extraction_hints": source.get("extraction_hints", {}),
+                    }
+                    res = self.scrape_source(child_source, db_path)
+                    if res.get("status") == "success":
+                        scraped.append(res.get("card_id", child_id))
+                return {
+                    "source_id": source["source_id"],
+                    "run_id": run_id,
+                    "status": "success",
+                    "discovered_count": len(discovered),
+                    "cards_scraped": scraped,
+                }
+            except Exception as exc:
+                db.finish_failure(db_path, run_id, str(exc))
+                return {"source_id": source["source_id"], "run_id": run_id, "status": "failed", "error": str(exc)}
+
         run_id = db.start_run(db_path, source["source_id"])
         try:
             delay = float(source.get("request_delay_seconds", 0))

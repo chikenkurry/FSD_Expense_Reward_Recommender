@@ -9,7 +9,7 @@ from .util import decimal_string
 
 PARSER_VERSION = "generic-html-jsonld-v1"
 MAX_EVIDENCE = 500
-MAX_TEXT = 200_000
+MAX_TEXT = 1_000_000
 
 
 class _TextParser(HTMLParser):
@@ -96,7 +96,7 @@ def extract(source: dict, html: str) -> dict:
     welcome = None
     hints = source.get("extraction_hints", {})
     snippets = _snippets(corpus)
-    cashback = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*%\s*(?:cash\s*back|cashback)", re.I)
+    cashback = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*%\s*(?:cash\s*back|cashback|cash\s*rebates?|rebates?)", re.I)
     earn = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(points?|miles?)\s*(?:per|/|for each)\s*(?:S?\$|USD\s*|SGD\s*|\$)?\s*(?:1|one)\b", re.I)
     amount_pattern = r"(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?"
     fee_direct = re.compile(r"annual\s+fee[^\d$]{0,30}(S\$|US\$|SGD\s*|USD\s*|\$)?\s*(" + amount_pattern + r")", re.I)
