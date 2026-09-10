@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    command: [serve, --config, config/sources.example.json, --db, /data/catalogue.sqlite, --host, 0.0.0.0]
+    environment:
+      CARD_ADMIN_BEARER: ${CARD_ADMIN_BEARER:?required}
+      CARD_INTERNAL_BEARER: ${CARD_INTERNAL_BEARER:?required}
+    volumes: [catalogue-data:/data]
+    ports: ["8080:8080"]
+  worker:
+    build: .
+    command: [worker, --once, --db, /data/catalogue.sqlite]
+    volumes: [catalogue-data:/data]
+    profiles: [manual-worker]
+volumes:
+  catalogue-data: {}
