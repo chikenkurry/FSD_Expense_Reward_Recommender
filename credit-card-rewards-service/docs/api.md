@@ -1,5 +1,8 @@
 # JSON HTTP API
 
+> [!NOTE]
+> For the complete, modern specification of all `/api/v1` public, internal recommendation snapshot, and admin endpoints with request/response schemas, see [API_REFERENCE.md](API_REFERENCE.md).
+
 The server defaults to `127.0.0.1:8080`; responses are JSON with UTF-8 content type. Errors are `{ "error": { "status": integer, "message": string } }`.
 
 | Method and path | Result |

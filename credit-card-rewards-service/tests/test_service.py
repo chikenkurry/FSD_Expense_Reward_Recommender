@@ -232,3 +232,58 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["discovered_count"], 1)
         self.assertIn("synthetic-hub-card", res["cards_scraped"])
+
+    def test_extract_min_spend_caps_and_exclusions(self):
+        sample_html = """
+        <html><body>
+        <h1>OCBC 365 Credit Card</h1>
+        <p>Earn 6% cashback on Dining and Food Delivery with min monthly spend of S$800.</p>
+        <p>Cashback capped at S$80 per calendar month across all categories.</p>
+        <p>Excludes government services, tax payments, e-wallet top-ups, insurance, and utilities bills.</p>
+        <p>Annual fee of S$162.00 waived for 2 years.</p>
+        </body></html>
+        """
+        record = extract(self.source, sample_html)
+        self.assertEqual(record["minimum_monthly_spend"], "800")
+        self.assertTrue(len(record["cap_groups"]) >= 1)
+        self.assertEqual(record["cap_groups"][0]["amount"], "80")
+        self.assertIn("9399", record["excluded_mccs"])
+        self.assertIn("6540", record["excluded_mccs"])
+        self.assertIn("6300", record["excluded_mccs"])
+        self.assertIn("4900", record["excluded_mccs"])
+        self.assertEqual(record["annual_fee"]["amount"], "162")
+
+    def test_extract_with_gemini_mocked(self):
+        from credit_card_service.extract import extract_with_gemini
+        gemini_mock_json = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "text": json.dumps({
+                            "rewards": [
+                                {"category": "dining", "earn_rate": "0.06", "unit": "cashback_percent", "minimum_spend": "800.00", "evidence": "6% dining"},
+                                {"category": "general", "earn_rate": "0.003", "unit": "cashback_percent", "minimum_spend": "0.00", "evidence": "0.3% general"}
+                            ],
+                            "annual_fee": {"amount": "196.20", "currency": "SGD", "first_year_waiver": True, "evidence": "Annual fee waived"},
+                            "minimum_monthly_spend": "800.00",
+                            "cap_groups": [{"cap_key": "monthly_rebate_cap", "amount": "70.00", "period": "calendar_month", "mode": "limited"}],
+                            "excluded_mccs": ["9399", "6540", "6300", "4900"],
+                            "welcome_offer": {"summary": "S$150 cashback welcome", "evidence": "Receive S$150"}
+                        })
+                    }]
+                }
+            }]
+        }
+        mock_resp = mock.MagicMock()
+        mock_resp.read.return_value = json.dumps(gemini_mock_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with mock.patch("urllib.request.urlopen", return_value=mock_resp):
+            res = extract_with_gemini("dummy text", self.source, api_key="test-key")
+            self.assertIsNotNone(res)
+            self.assertEqual(res["minimum_monthly_spend"], "800")
+            self.assertEqual(res["annual_fee"]["amount"], "196.2")
+            self.assertEqual(len(res["rewards"]), 2)
+            self.assertIn("9399", res["excluded_mccs"])
+            self.assertEqual(res["cap_groups"][0]["amount"], "70")
+

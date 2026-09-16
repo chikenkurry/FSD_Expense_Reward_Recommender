@@ -113,7 +113,7 @@ class Scraper:
     def _request(self, url: str, max_bytes: int = MAX_RESPONSE_BYTES, request_delay: float = 0):
         self._check_url(url)
         self._pace(url, request_delay)
-        request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
+        request = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/pdf"})
         try:
             response = self._opener.open(request, timeout=self.timeout)
         except HTTPError as exc:
@@ -290,10 +290,15 @@ class Scraper:
             else:
                 raise last_error or ScrapeError("fetch failed")
             content_type = (headers.get("content-type") or "").lower()
-            if not any(kind in content_type for kind in ("text/html", "application/xhtml+xml")):
-                raise ScrapeError("unsupported content type; expected HTML")
-            html = body.decode("utf-8", errors="replace")
-            facts = extract(source, html)
+            if not any(kind in content_type for kind in ("text/html", "application/xhtml+xml", "application/pdf")):
+                raise ScrapeError("unsupported content type; expected HTML or PDF")
+            if "application/pdf" in content_type or body.startswith(b"%PDF"):
+                from .extract import extract_pdf_text
+                pdf_text = extract_pdf_text(body)
+                facts = extract(source, pdf_text)
+            else:
+                html = body.decode("utf-8", errors="replace")
+                facts = extract(source, html)
             record = {"card_id": source["card_id"], "issuer": source["issuer"], "name": source["name"], "source_url": final_url,
                 **facts, "provenance": {"source_id": source["source_id"], "fetched_at": utc_now(), "content_sha256": hashlib.sha256(body).hexdigest(), "parser_version": PARSER_VERSION},
                 "status": "success", "error": None}

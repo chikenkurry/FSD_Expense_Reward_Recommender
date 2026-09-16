@@ -348,7 +348,149 @@ class V2ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("sources", data)
 
+    def test_card_reward_simulation_endpoint(self):
+        """POST /api/v1/cards/simulate evaluates spend, applies rules, enforces exclusions, and ranks cards."""
+        # 1. Validation errors
+        status, err, _ = self._req("/api/v1/cards/simulate", method="POST", body={"monthly_spend": []})
+        self.assertEqual(status, 422)
+
+        status, err, _ = self._req("/api/v1/cards/simulate", method="POST", body={"monthly_spend": [{"amount": "-50.00"}]})
+        self.assertEqual(status, 422)
+
+        status, err, _ = self._req(
+            "/api/v1/cards/simulate",
+            method="POST",
+            body={"monthly_spend": [{"amount": "100.00"}], "card_ids": ["not-a-uuid"]},
+        )
+        self.assertEqual(status, 422)
+
+        # 2. Successful simulation with MCC exclusions
+        spend_basket = [
+            {"amount": "400.00", "category": "dining", "mcc": "5812", "description": "Restaurant Dinner"},
+            {"amount": "300.00", "category": "groceries", "mcc": "5411", "description": "Supermarket Groceries"},
+            {"amount": "150.00", "category": "utilities", "mcc": "4900", "description": "Power & Water Bill"},
+        ]
+        status, result, _ = self._req("/api/v1/cards/simulate", method="POST", body={"monthly_spend": spend_basket})
+        self.assertEqual(status, 200)
+        self.assertEqual(result["total_monthly_spend"], "850.00")
+        self.assertEqual(result["transactions_count"], 3)
+        self.assertTrue(len(result["ranked_cards"]) >= 1)
+
+        top_card = result["ranked_cards"][0]
+        self.assertEqual(top_card["rank"], 1)
+        self.assertIn("effective_reward_rate", top_card)
+        self.assertTrue(float(top_card["total_reward_earned"]) > 0)
+
+        # Check that the MCC 4900 utility transaction is appropriately processed
+        breakdown = top_card["breakdown"]
+        self.assertEqual(len(breakdown), 3)
+        util_item = next(b for b in breakdown if b["mcc"] == "4900")
+        self.assertEqual(util_item["amount"], "150.00")
+
+    def test_pdf_stream_text_extraction(self):
+        """extract_pdf_text extracts text from standard zlib FlateDecode PDF stream objects."""
+        import zlib
+        from credit_card_service.extract import extract_pdf_text
+
+        content_stream = b"BT /F1 12 Tf 72 712 Td (DBS Altitude Visa Card) Tj 0 -14 Td [(Earn) 20 (1.2) 20 (miles) 20 (per) 20 ($1)] TJ ET"
+        compressed = zlib.compress(content_stream)
+        pdf_bytes = (
+            b"%PDF-1.4\n1 0 obj\n<< /Length " + str(len(compressed)).encode() + b" /Filter /FlateDecode >>\nstream\n"
+            + compressed
+            + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF"
+        )
+        extracted = extract_pdf_text(pdf_bytes)
+        self.assertIn("DBS Altitude Visa Card", extracted)
+        self.assertIn("1.2", extracted)
+        self.assertIn("miles", extracted)
+
+    def test_reward_simulation_mechanics_direct(self):
+        """Direct unit test of minimum spend tiers, caps, and MCC exclusions."""
+        card_detail = {
+            "card": {"card_id": "test-card-1", "name": "Singapore Cashback Special", "reward_type": "cashback"},
+            "terms": {
+                "minimum_monthly_spend": "600.00",
+                "excluded_mccs": ["9399", "6540", "4900"],
+                "cap_groups": [{"cap_key": "monthly_bonus_cap", "amount": "30.00", "period": "calendar_month"}],
+                "rules": [
+                    {"rule_key": "base_rate", "kind": "cashback", "rate": "0.003", "reward_unit": "cashback_percent"},
+                    {"rule_key": "dining_bonus", "kind": "cashback", "rate": "0.080", "reward_unit": "cashback_percent", "cap_group_keys": ["monthly_bonus_cap"]},
+                ],
+            },
+        }
+
+        # Case A: Spend under minimum threshold ($400 < $600) -> earns fallback base rate (0.3%)
+        sub_min_spend = [
+            {"amount": "400.00", "category": "dining", "mcc": "5812", "description": "Dining under threshold"}
+        ]
+        res_a = db.simulate_card_rewards(card_detail, sub_min_spend)
+        self.assertFalse(res_a["minimum_spend_met"])
+        self.assertEqual(res_a["total_reward_earned"], "1.20")  # 400 * 0.003 = 1.20
+        self.assertIn("min spend", res_a["breakdown"][0]["reason"])
+
+        # Case B: Spend over minimum threshold ($800 >= $600) with dining bonus + MCC 4900 exclusion + cap clamping
+        full_spend = [
+            {"amount": "500.00", "category": "dining", "mcc": "5812", "description": "Dining (8% = $40, but capped at $30)"},
+            {"amount": "200.00", "category": "utilities", "mcc": "4900", "description": "Power bill (MCC 4900 excluded)"},
+            {"amount": "100.00", "category": "general", "mcc": "5999", "description": "General retail"},
+        ]
+        res_b = db.simulate_card_rewards(card_detail, full_spend)
+        self.assertTrue(res_b["minimum_spend_met"])
+        # Dining raw = $40, capped at $30.00
+        # Utilities = $0.00 (excluded by MCC 4900)
+        # General = $100 * 0.003 = $0.30
+        # Total = $30.30
+        self.assertEqual(res_b["total_reward_earned"], "30.30")
+        self.assertEqual(res_b["breakdown"][1]["status"], "excluded")
+        self.assertEqual(res_b["breakdown"][1]["reward_earned"], "0.00")
+        self.assertIn("Capped", res_b["breakdown"][0]["reason"])
+
+    def test_mysql_abstraction_translation_and_config(self):
+        """Verify URL parsing, engine detection, and SQL dialect translation for MySQL."""
+        # 1. URL parsing
+        url = "mysql+pymysql://card_user:secret123@db-host:3307/card_catalogue"
+        parsed = db.parse_mysql_url(url)
+        self.assertEqual(parsed["host"], "db-host")
+        self.assertEqual(parsed["port"], 3307)
+        self.assertEqual(parsed["user"], "card_user")
+        self.assertEqual(parsed["password"], "secret123")
+        self.assertEqual(parsed["database"], "card_catalogue")
+
+        # 2. Engine detection
+        self.assertTrue(db.is_mysql("mysql://localhost/test"))
+        self.assertTrue(db.is_mysql("mysql+pymysql://user:pass@host/db"))
+        self.assertFalse(db.is_mysql("/data/catalogue.sqlite"))
+
+        # 3. Query transformation
+        q1 = db.sqlite_to_mysql_query("INSERT OR IGNORE INTO banks (bank_id, name) VALUES (?, ?)")
+        self.assertIn("INSERT IGNORE INTO", q1)
+        self.assertIn("%s", q1)
+        self.assertNotIn("?", q1)
+
+        q2 = db.sqlite_to_mysql_query("INSERT OR REPLACE INTO documents VALUES (?, ?, ?)")
+        self.assertIn("REPLACE INTO", q2)
+
+        q3 = db.sqlite_to_mysql_query("SELECT * FROM runs WHERE lease_until = datetime('now', '+60 seconds') AND id = ?")
+        self.assertIn("DATE_ADD(UTC_TIMESTAMP(), INTERVAL 60 SECOND)", q3)
+        self.assertIn("%s", q3)
+
+        # 4. Cursor wrapper behavior
+        class MockRawCursor:
+            def __init__(self):
+                self.lastrowid = 42
+                self.rowcount = 3
+            def fetchone(self): return {"col": "val"}
+            def fetchall(self): return [{"col": "val"}]
+            def close(self): pass
+
+        cursor_wrapper = db.MySQLCursorWrapper(MockRawCursor())
+        self.assertEqual(cursor_wrapper.lastrowid, 42)
+        self.assertEqual(cursor_wrapper.rowcount, 3)
+        self.assertEqual(cursor_wrapper.fetchone(), {"col": "val"})
+        self.assertEqual(len(cursor_wrapper.fetchall()), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

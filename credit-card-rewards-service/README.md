@@ -27,4 +27,4 @@ make verify
 python3 scripts/demo_acceptance.py
 ```
 
-See [architecture](docs/architecture.md), [database](docs/database.md), [deployment](docs/deployment.md), [testing](docs/testing.md), and [rubric alignment](docs/rubric-alignment.md). `openapi.json` and `schemas/` are committed integration artifacts.
+See [API reference](docs/API_REFERENCE.md), [architecture](docs/architecture.md), [database](docs/database.md), [deployment](docs/deployment.md), [testing](docs/testing.md), and [rubric alignment](docs/rubric-alignment.md). `openapi.json` and `schemas/` are committed integration artifacts.

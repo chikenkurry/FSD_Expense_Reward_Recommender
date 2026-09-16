@@ -1,6 +1,6 @@
 """Database persistence layer for the credit card rewards catalogue.
 
-Supports SQLite in WAL mode with relational tables, foreign key constraints,
+Supports SQLite in WAL mode and MySQL 8.0 with relational tables, foreign key constraints,
 and JSON-based schemas for complex reward rules and term specifications.
 """
 
@@ -9,11 +9,19 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
+import re
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+
+try:
+    import pymysql
+    import pymysql.cursors
+except ImportError:
+    pymysql = None
 
 from .util import json_dumps, utc_now
 
@@ -22,6 +30,135 @@ DEMO_BANK_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 DEMO_SOURCE_ID = "33333333-3333-4333-8333-333333333333"
 DEMO_DOCUMENT_ID = "44444444-4444-4444-8444-444444444444"
 DEMO_CARD_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def is_mysql(path: str) -> bool:
+    """Check if the path or environment DATABASE_URL targets a MySQL database."""
+    target = path or os.environ.get("DATABASE_URL", "")
+    return target.startswith("mysql://") or target.startswith("mysql+pymysql://")
+
+
+def parse_mysql_url(url_str: str) -> dict[str, Any]:
+    """Parse MySQL connection parameters from standard connection string."""
+    if url_str.startswith("mysql+pymysql://"):
+        url_str = "mysql://" + url_str[len("mysql+pymysql://"):]
+    parsed = urlparse(url_str)
+    return {
+        "host": parsed.hostname or "127.0.0.1",
+        "port": parsed.port or 3306,
+        "user": parsed.username or "root",
+        "password": parsed.password or "",
+        "database": parsed.path.lstrip("/"),
+    }
+
+
+def sqlite_to_mysql_query(sql: str) -> str:
+    """Translate SQLite-specific SQL idioms and parameter placeholders to MySQL syntax."""
+    # 1. Translate INSERT OR IGNORE and INSERT OR REPLACE
+    sql = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT IGNORE INTO", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "REPLACE INTO", sql, flags=re.IGNORECASE)
+    # 2. Translate SQLite date/time expressions to MySQL equivalents
+    sql = re.sub(r"datetime\('now',\s*'\+60 seconds'\)", "DATE_ADD(UTC_TIMESTAMP(), INTERVAL 60 SECOND)", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"datetime\('now',\s*'-14 days'\)", "DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY)", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"datetime\(([^)]+)\)", r"\1", sql, flags=re.IGNORECASE)
+    # 3. Replace ? parameter placeholders with %s outside single-quoted strings
+    sql = re.sub(r"\?(?=(?:[^']*'[^']*')*[^']*$)", "%s", sql)
+    return sql
+
+
+class MySQLCursorWrapper:
+    """Wrapper around PyMySQL cursor matching SQLite Row and Cursor ergonomics."""
+
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+
+    def fetchone(self) -> dict[str, Any] | None:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        return self._cursor.fetchall()
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self) -> int | None:
+        return self._cursor.lastrowid
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+    def close(self) -> None:
+        self._cursor.close()
+
+
+class MySQLConnectionWrapper:
+    """PyMySQL connection wrapper with automatic transaction management and dialect adaptation."""
+
+    def __init__(self, raw_conn: Any) -> None:
+        self._raw_conn = raw_conn
+
+    def execute(self, sql: str, params: tuple | list = ()) -> MySQLCursorWrapper:
+        clean_sql = sql.strip()
+        upper_sql = clean_sql.upper()
+        if upper_sql in ("BEGIN IMMEDIATE", "BEGIN"):
+            try:
+                self._raw_conn.begin()
+            except Exception:
+                pass
+            class _DummyCursor:
+                lastrowid = None
+                rowcount = 0
+                def fetchone(self): return None
+                def fetchall(self): return []
+                def __iter__(self): return iter([])
+                def close(self): pass
+            return MySQLCursorWrapper(_DummyCursor())
+
+        transformed = sqlite_to_mysql_query(sql)
+        cursor = self._raw_conn.cursor()
+        cursor.execute(transformed, params or ())
+        return MySQLCursorWrapper(cursor)
+
+    def executemany(self, sql: str, seq_of_params: list | tuple) -> MySQLCursorWrapper:
+        transformed = sqlite_to_mysql_query(sql)
+        cursor = self._raw_conn.cursor()
+        cursor.executemany(transformed, seq_of_params)
+        return MySQLCursorWrapper(cursor)
+
+    def executescript(self, script: str) -> None:
+        for stmt in script.split(";"):
+            cleaned = stmt.strip()
+            if cleaned and not cleaned.startswith("--"):
+                self.execute(cleaned)
+
+    def commit(self) -> None:
+        self._raw_conn.commit()
+
+    def rollback(self) -> None:
+        try:
+            self._raw_conn.rollback()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            self._raw_conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> MySQLConnectionWrapper:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        try:
+            if exc_type is not None:
+                self.rollback()
+            else:
+                self.commit()
+        finally:
+            self.close()
 
 
 class _Connection(sqlite3.Connection):
@@ -34,8 +171,321 @@ class _Connection(sqlite3.Connection):
             self.close()
 
 
-def connect(path: str) -> sqlite3.Connection:
-    """Connect to SQLite database with WAL journal mode, busy timeouts, and foreign keys."""
+def _init_mysql(conn: Any) -> None:
+    """Initialize MySQL 8.0 schema tables and indexes with InnoDB and UTF-8 collation."""
+    ddl_statements = [
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INT PRIMARY KEY,
+            applied_at VARCHAR(100) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS scrape_runs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            source_id VARCHAR(64) NOT NULL,
+            started_at VARCHAR(100) NOT NULL,
+            completed_at VARCHAR(100),
+            status VARCHAR(64) NOT NULL,
+            error TEXT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS card_snapshots (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            run_id INT NOT NULL,
+            source_id VARCHAR(64) NOT NULL,
+            card_id VARCHAR(64) NOT NULL,
+            fetched_at VARCHAR(100) NOT NULL,
+            content_sha256 VARCHAR(64) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES scrape_runs(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS current_cards (
+            card_id VARCHAR(64) PRIMARY KEY,
+            snapshot_id INT NOT NULL,
+            source_id VARCHAR(64) NOT NULL,
+            issuer VARCHAR(255) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            updated_at VARCHAR(100) NOT NULL,
+            FOREIGN KEY (snapshot_id) REFERENCES card_snapshots(id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE OR REPLACE VIEW current_card_view AS
+        SELECT card_id, source_id, issuer, payload_json, updated_at FROM current_cards
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS banks (
+            bank_id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            normalized_name VARCHAR(255) NOT NULL UNIQUE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS sources (
+            source_id VARCHAR(36) PRIMARY KEY,
+            bank_id VARCHAR(36),
+            name VARCHAR(255) NOT NULL,
+            domain VARCHAR(255) NOT NULL,
+            kind VARCHAR(64) NOT NULL,
+            adapter_key VARCHAR(64) NOT NULL,
+            enabled TINYINT NOT NULL,
+            access_review_status VARCHAR(64) NOT NULL,
+            refresh_interval_hours INT NOT NULL,
+            last_attempt_at VARCHAR(100),
+            last_success_at VARCHAR(100),
+            FOREIGN KEY (bank_id) REFERENCES banks(bank_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS source_documents (
+            document_id VARCHAR(36) PRIMARY KEY,
+            source_id VARCHAR(36) NOT NULL,
+            label VARCHAR(255) NOT NULL,
+            document_type VARCHAR(64) NOT NULL,
+            path_key VARCHAR(255) NOT NULL,
+            enabled TINYINT NOT NULL,
+            fixture_text LONGTEXT,
+            UNIQUE KEY uq_source_doc (source_id, path_key),
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS ingestion_runs (
+            run_id VARCHAR(36) PRIMARY KEY,
+            source_id VARCHAR(36) NOT NULL,
+            scope_hash VARCHAR(64) NOT NULL,
+            scope_json LONGTEXT NOT NULL,
+            reason VARCHAR(64) NOT NULL,
+            status VARCHAR(64) NOT NULL,
+            created_at VARCHAR(100) NOT NULL,
+            started_at VARCHAR(100),
+            finished_at VARCHAR(100),
+            attempt INT NOT NULL DEFAULT 0,
+            lease_owner VARCHAR(255),
+            lease_until VARCHAR(100),
+            counters_json LONGTEXT NOT NULL,
+            error_summary LONGTEXT,
+            FOREIGN KEY (source_id) REFERENCES sources(source_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS run_failures (
+            failure_id INT AUTO_INCREMENT PRIMARY KEY,
+            run_id VARCHAR(36) NOT NULL,
+            document_id VARCHAR(36),
+            stage VARCHAR(64) NOT NULL,
+            code VARCHAR(64) NOT NULL,
+            message LONGTEXT NOT NULL,
+            retryable TINYINT NOT NULL,
+            FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id),
+            FOREIGN KEY (document_id) REFERENCES source_documents(document_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS raw_snapshots (
+            snapshot_id VARCHAR(36) PRIMARY KEY,
+            document_id VARCHAR(36) NOT NULL,
+            run_id VARCHAR(36) NOT NULL,
+            content_hash VARCHAR(64) NOT NULL,
+            fetched_at VARCHAR(100) NOT NULL,
+            extracted_text LONGTEXT NOT NULL,
+            UNIQUE KEY uq_doc_hash (document_id, content_hash),
+            FOREIGN KEY (document_id) REFERENCES source_documents(document_id),
+            FOREIGN KEY (run_id) REFERENCES ingestion_runs(run_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS extraction_candidates (
+            candidate_id VARCHAR(36) PRIMARY KEY,
+            scrape_run_id VARCHAR(36) NOT NULL,
+            source_id VARCHAR(36) NOT NULL,
+            bank_id VARCHAR(36) NOT NULL,
+            card_id VARCHAR(64),
+            base_card_version_id VARCHAR(36),
+            review_status VARCHAR(64) NOT NULL,
+            review_revision INT NOT NULL DEFAULT 1,
+            created_at VARCHAR(100) NOT NULL,
+            updated_at VARCHAR(100) NOT NULL,
+            content_hash VARCHAR(64) NOT NULL,
+            parser_version VARCHAR(64) NOT NULL,
+            material_change TINYINT NOT NULL,
+            candidate_json LONGTEXT NOT NULL,
+            UNIQUE KEY uq_src_hash_parser (source_id, content_hash, parser_version),
+            FOREIGN KEY (scrape_run_id) REFERENCES ingestion_runs(run_id),
+            FOREIGN KEY (source_id) REFERENCES sources(source_id),
+            FOREIGN KEY (bank_id) REFERENCES banks(bank_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_issues (
+            issue_id INT AUTO_INCREMENT PRIMARY KEY,
+            candidate_id VARCHAR(36) NOT NULL,
+            severity VARCHAR(64) NOT NULL,
+            code VARCHAR(64) NOT NULL,
+            field_path VARCHAR(255) NOT NULL,
+            message LONGTEXT NOT NULL,
+            FOREIGN KEY (candidate_id) REFERENCES extraction_candidates(candidate_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_diffs (
+            diff_id INT AUTO_INCREMENT PRIMARY KEY,
+            candidate_id VARCHAR(36) NOT NULL,
+            operation VARCHAR(64) NOT NULL,
+            field_path VARCHAR(255) NOT NULL,
+            old_value LONGTEXT,
+            new_value LONGTEXT,
+            material TINYINT NOT NULL,
+            FOREIGN KEY (candidate_id) REFERENCES extraction_candidates(candidate_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS candidate_audit (
+            audit_id INT AUTO_INCREMENT PRIMARY KEY,
+            candidate_id VARCHAR(36) NOT NULL,
+            action VARCHAR(64) NOT NULL,
+            actor VARCHAR(255) NOT NULL,
+            at VARCHAR(100) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            FOREIGN KEY (candidate_id) REFERENCES extraction_candidates(candidate_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cards (
+            card_id VARCHAR(64) PRIMARY KEY,
+            bank_id VARCHAR(36) NOT NULL,
+            market VARCHAR(64) NOT NULL,
+            product_key VARCHAR(255) NOT NULL,
+            name VARCHAR(255) NOT NULL,
+            normalized_name VARCHAR(255) NOT NULL,
+            UNIQUE KEY uq_bank_mkt_prod (bank_id, market, product_key),
+            FOREIGN KEY (bank_id) REFERENCES banks(bank_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS card_versions (
+            card_version_id VARCHAR(36) PRIMARY KEY,
+            card_id VARCHAR(64) NOT NULL,
+            created_at VARCHAR(100) NOT NULL,
+            effective_from VARCHAR(100),
+            effective_to VARCHAR(100),
+            terms_json LONGTEXT NOT NULL,
+            summary_json LONGTEXT NOT NULL,
+            content_hash VARCHAR(64) NOT NULL,
+            immutable TINYINT NOT NULL DEFAULT 1,
+            UNIQUE KEY uq_card_hash (card_id, content_hash),
+            FOREIGN KEY (card_id) REFERENCES cards(card_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS reward_rules (
+            rule_id INT AUTO_INCREMENT PRIMARY KEY,
+            card_version_id VARCHAR(36) NOT NULL,
+            rule_key VARCHAR(255) NOT NULL,
+            kind VARCHAR(64) NOT NULL,
+            rate VARCHAR(64) NOT NULL,
+            reward_unit VARCHAR(64) NOT NULL,
+            stacking_policy VARCHAR(64) NOT NULL,
+            period VARCHAR(64) NOT NULL,
+            rule_json LONGTEXT NOT NULL,
+            UNIQUE KEY uq_ver_rule (card_version_id, rule_key),
+            FOREIGN KEY (card_version_id) REFERENCES card_versions(card_version_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS evidence_links (
+            evidence_id VARCHAR(36) PRIMARY KEY,
+            card_version_id VARCHAR(36) NOT NULL,
+            field_path VARCHAR(255) NOT NULL,
+            source_url VARCHAR(1000) NOT NULL,
+            document_type VARCHAR(64) NOT NULL,
+            locator VARCHAR(255) NOT NULL,
+            snippet TEXT NOT NULL,
+            fetched_at VARCHAR(100) NOT NULL,
+            FOREIGN KEY (card_version_id) REFERENCES card_versions(card_version_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS catalogue_publications (
+            catalogue_revision INT AUTO_INCREMENT PRIMARY KEY,
+            card_id VARCHAR(64) NOT NULL,
+            card_version_id VARCHAR(36) NOT NULL,
+            published_at VARCHAR(100) NOT NULL,
+            superseded_revision INT,
+            FOREIGN KEY (card_id) REFERENCES cards(card_id),
+            FOREIGN KEY (card_version_id) REFERENCES card_versions(card_version_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS decisions (
+            decision_id VARCHAR(36) PRIMARY KEY,
+            candidate_id VARCHAR(36) NOT NULL,
+            decision VARCHAR(64) NOT NULL,
+            reason LONGTEXT NOT NULL,
+            actor VARCHAR(255) NOT NULL,
+            decided_at VARCHAR(100) NOT NULL,
+            publication_revision INT,
+            FOREIGN KEY (candidate_id) REFERENCES extraction_candidates(candidate_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS idempotency_records (
+            caller VARCHAR(255) NOT NULL,
+            endpoint VARCHAR(255) NOT NULL,
+            idem_key VARCHAR(255) NOT NULL,
+            body_hash VARCHAR(64) NOT NULL,
+            status INT NOT NULL,
+            headers_json LONGTEXT NOT NULL,
+            response_json LONGTEXT NOT NULL,
+            created_at VARCHAR(100) NOT NULL,
+            expires_at VARCHAR(100) NOT NULL,
+            PRIMARY KEY (caller, endpoint, idem_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+    ]
+    for stmt in ddl_statements:
+        conn.execute(stmt)
+
+    index_statements = [
+        "CREATE INDEX snapshots_card_idx ON card_snapshots(card_id, id)",
+        "CREATE INDEX active_run_unique ON ingestion_runs(source_id, scope_hash, status)",
+        "CREATE INDEX current_pub_idx ON catalogue_publications(card_id, superseded_revision)",
+        "CREATE INDEX source_fresh_idx ON sources(enabled, access_review_status, last_success_at)",
+        "CREATE INDEX candidates_queue_idx ON extraction_candidates(review_status, created_at, candidate_id)",
+        "CREATE INDEX version_lookup_idx ON card_versions(card_id, created_at)",
+        "CREATE INDEX idem_expiry_idx ON idempotency_records(expires_at)",
+    ]
+    for idx_sql in index_statements:
+        try:
+            conn.execute(idx_sql)
+        except Exception:
+            pass
+
+
+def connect(path: str) -> Any:
+    """Connect to database (MySQL if path/DATABASE_URL is MySQL, else SQLite)."""
+    if is_mysql(path):
+        target = path if (path.startswith("mysql://") or path.startswith("mysql+pymysql://")) else os.environ.get("DATABASE_URL", path)
+        if pymysql is None:
+            raise RuntimeError("PyMySQL is required for MySQL connections. Run pip install pymysql.")
+        cfg = parse_mysql_url(target)
+        raw_conn = pymysql.connect(
+            host=cfg["host"],
+            port=cfg["port"],
+            user=cfg["user"],
+            password=cfg["password"],
+            database=cfg["database"],
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True,
+            connect_timeout=10,
+        )
+        return MySQLConnectionWrapper(raw_conn)
+
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, factory=_Connection, timeout=5, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -47,6 +497,15 @@ def connect(path: str) -> sqlite3.Connection:
 
 def initialize(path: str) -> None:
     """Initialize relational schema, constraints, and audit tables if not already present."""
+    if is_mysql(path):
+        with connect(path) as conn:
+            _init_mysql(conn)
+            conn.execute(
+                "INSERT IGNORE INTO schema_migrations VALUES(?, ?)",
+                (SCHEMA_VERSION, utc_now()),
+            )
+        return
+
     with connect(path) as conn:
         conn.executescript(
             """
@@ -421,9 +880,15 @@ def finish_success(path: str, run_id: int, record: dict) -> None:
             if fee_curr == "UNKNOWN":
                 fee_curr = "SGD"
             terms = {
+                "schema_version": "card_terms.v1",
+                "currency": fee_curr,
                 "annual_fee": fee_amount,
-                "first_year_waiver": True if fee_amount == "0.00" else False,
-                "foreign_currency_fee_rate": "0.0325",
+                "annual_fee_status": "known",
+                "first_year_waiver": record.get("first_year_waiver", True if fee_amount == "0.00" else False),
+                "foreign_currency_fee_rate": record.get("foreign_currency_fee_rate", "0.0325"),
+                "minimum_monthly_spend": record.get("minimum_monthly_spend"),
+                "cap_groups": record.get("cap_groups", []),
+                "excluded_mccs": record.get("excluded_mccs", ["9399", "6540", "6300", "4900"]),
                 "rules": rules,
             }
             primary_reward = "cashback"
@@ -954,7 +1419,7 @@ def process_one(path: str, worker_id: str = "worker") -> dict | None:
                     )
                 counts["parsed"] += 1
                 counts["candidates_created"] += 1
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, pymysql.IntegrityError if pymysql else sqlite3.IntegrityError):
                 counts["unchanged"] += 1
 
         status = "succeeded" if not counts["failed"] else ("partial" if counts["parsed"] else "failed")
@@ -1414,3 +1879,189 @@ def idempotency_put(
                 expires_at,
             ),
         )
+
+
+def simulate_card_rewards(card_detail: dict, monthly_spend: list[dict]) -> dict:
+    """Simulate rewards earned on a credit card for a monthly transaction basket.
+
+    Enforces Singapore credit card rule mechanics:
+    - Minimum monthly spend thresholds (downgrades to base rate if unfulfilled)
+    - MCC exclusion lists (e.g. government 9399, e-wallets 6540, utilities 4900)
+    - Category bonus matching
+    - Cap group limits (monthly or category caps)
+    """
+    card = card_detail.get("card", {})
+    terms = card_detail.get("terms", {})
+    rules = terms.get("rules", [])
+
+    total_spend = sum(float(tx["amount"]) for tx in monthly_spend)
+
+    min_spend = None
+    if terms.get("minimum_monthly_spend"):
+        try:
+            min_spend = float(terms["minimum_monthly_spend"])
+        except (ValueError, TypeError):
+            pass
+
+    excluded_mccs = set(str(mcc) for mcc in terms.get("excluded_mccs", []))
+
+    # Cap groups mapping: cap_key -> max_amount
+    cap_limits: dict[str, float] = {}
+    for cap in terms.get("cap_groups", []):
+        if isinstance(cap, dict) and cap.get("cap_key") and cap.get("amount"):
+            try:
+                cap_limits[cap["cap_key"]] = float(cap["amount"])
+            except (ValueError, TypeError):
+                pass
+
+    # Determine base rate
+    base_rate = 0.01
+    for r in rules:
+        if r.get("rule_key") in ("base_rate", "base_cashback") or not r.get("match", {}).get("category_keys"):
+            try:
+                base_rate = float(r.get("rate", "0.01"))
+            except (ValueError, TypeError):
+                pass
+            break
+
+    min_spend_met = True if min_spend is None else (total_spend >= min_spend)
+    cap_accumulated: dict[str, float] = {k: 0.0 for k in cap_limits}
+
+    breakdown = []
+    total_reward = 0.0
+
+    for tx in monthly_spend:
+        amt = float(tx["amount"])
+        mcc = str(tx.get("mcc", "")).strip()
+        cat = str(tx.get("category", "general")).lower().strip()
+        desc = tx.get("description", f"{cat.title()} spend")
+
+        if mcc and mcc in excluded_mccs:
+            breakdown.append({
+                "description": desc,
+                "amount": f"{amt:.2f}",
+                "category": cat,
+                "mcc": mcc,
+                "rate": "0.0000",
+                "reward_earned": "0.00",
+                "status": "excluded",
+                "reason": f"Excluded by MCC {mcc} (e.g. government/e-wallet/utilities)",
+            })
+            continue
+
+        matched_rule = None
+        for r in rules:
+            rule_key = r.get("rule_key", "").lower()
+            match_cats = [c.lower() for c in r.get("match", {}).get("category_keys", [])]
+            if cat in rule_key or cat in match_cats:
+                matched_rule = r
+                break
+
+        applied_rate = base_rate
+        rule_name = "Base rate"
+        cap_key = None
+
+        if matched_rule:
+            rule_min = None
+            if matched_rule.get("minimum_spend"):
+                try:
+                    rule_min = float(matched_rule["minimum_spend"])
+                except (ValueError, TypeError):
+                    pass
+
+            rule_threshold_met = (rule_min is None or total_spend >= rule_min)
+
+            if min_spend_met and rule_threshold_met:
+                try:
+                    applied_rate = float(matched_rule.get("rate", base_rate))
+                    rule_name = f"Bonus '{cat}' rate"
+                    caps = matched_rule.get("cap_group_keys", [])
+                    if caps:
+                        cap_key = caps[0]
+                    elif matched_rule.get("cap_group_key"):
+                        cap_key = matched_rule["cap_group_key"]
+                except (ValueError, TypeError):
+                    applied_rate = base_rate
+            else:
+                threshold_needed = min_spend if min_spend is not None else rule_min
+                rule_name = f"Base rate (min spend ${threshold_needed:.2f} not reached)"
+        else:
+            if not min_spend_met:
+                rule_name = f"Base rate (min spend ${min_spend:.2f} not reached)"
+
+        raw_reward = round(amt * applied_rate, 4)
+        capped_reward = raw_reward
+
+        if cap_key and cap_key in cap_limits:
+            limit = cap_limits[cap_key]
+            current = cap_accumulated[cap_key]
+            if current >= limit:
+                capped_reward = 0.0
+                rule_name += f" (Capped: max ${limit:.2f} reached for {cap_key})"
+            elif current + raw_reward > limit:
+                capped_reward = limit - current
+                rule_name += f" (Partially Capped: hit ${limit:.2f} limit for {cap_key})"
+                cap_accumulated[cap_key] = limit
+            else:
+                cap_accumulated[cap_key] += raw_reward
+
+        total_reward += capped_reward
+        breakdown.append({
+            "description": desc,
+            "amount": f"{amt:.2f}",
+            "category": cat,
+            "mcc": mcc,
+            "rate": f"{applied_rate:.4f}",
+            "reward_earned": f"{capped_reward:.2f}",
+            "status": "applied",
+            "reason": rule_name,
+        })
+
+    effective_rate = f"{(total_reward / total_spend * 100):.2f}%" if total_spend > 0 else "0.00%"
+
+    return {
+        "card_id": card.get("card_id"),
+        "card_name": card.get("name", "Unknown Card"),
+        "issuer": card.get("bank", {}).get("name") if isinstance(card.get("bank"), dict) else card.get("issuer", "Bank"),
+        "reward_type": card.get("reward_type", "cashback"),
+        "currency": card.get("currency", "SGD"),
+        "total_monthly_spend": f"{total_spend:.2f}",
+        "total_reward_earned": f"{total_reward:.2f}",
+        "effective_reward_rate": effective_rate,
+        "minimum_spend_met": min_spend_met,
+        "minimum_monthly_spend": f"{min_spend:.2f}" if min_spend is not None else None,
+        "breakdown": breakdown,
+    }
+
+
+def simulate_rewards_all(path: str, card_ids: list[str] | None, monthly_spend: list[dict]) -> dict:
+    """Run reward simulation across cards and return ranked recommendations."""
+    initialize(path)
+    cards_detail: list[dict] = []
+
+    if card_ids:
+        for cid in card_ids:
+            detail = current_detail(path, cid)
+            if detail:
+                cards_detail.append(detail)
+    else:
+        _, published = published_cards(path)
+        for c in published:
+            detail = current_detail(path, c["card_id"])
+            if detail:
+                cards_detail.append(detail)
+
+    simulated = [simulate_card_rewards(detail, monthly_spend) for detail in cards_detail]
+    simulated.sort(key=lambda x: float(x["total_reward_earned"]), reverse=True)
+
+    for idx, item in enumerate(simulated, 1):
+        item["rank"] = idx
+
+    total_spend = sum(float(tx["amount"]) for tx in monthly_spend)
+    return {
+        "total_monthly_spend": f"{total_spend:.2f}",
+        "currency": "SGD",
+        "transactions_count": len(monthly_spend),
+        "ranked_cards": simulated,
+    }
+
