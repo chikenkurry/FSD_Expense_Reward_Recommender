@@ -240,11 +240,16 @@ def extract_with_gemini(corpus: str, source: dict, api_key: str | None = None) -
                     "evidence": str(parsed["welcome_offer"].get("evidence", ""))[:MAX_EVIDENCE],
                 }
 
+            reset_period = "calendar_month"
+            if str(parsed.get("reset_period", "")).lower() in ("calendar_month", "statement_cycle", "quarterly"):
+                reset_period = str(parsed["reset_period"]).lower()
+
             return {
                 "annual_fee": annual_fee,
                 "rewards": rewards,
                 "welcome_offer": welcome,
                 "minimum_monthly_spend": min_spend,
+                "reset_period": reset_period,
                 "cap_groups": cap_groups,
                 "excluded_mccs": [str(c) for c in parsed.get("excluded_mccs", []) if str(c).isdigit()],
                 "foreign_currency_fee_rate": "0.0325",
@@ -372,11 +377,18 @@ def extract(source: dict, html: str | bytes) -> dict:
         if re.search(r"\b(utilities|electricity)\b", corpus, re.I):
             standard_mccs.append("4900")
 
+    reset_period = "calendar_month"
+    if re.search(r"\b(quarterly|each\s+quarter|per\s+quarter)\b", corpus, re.I):
+        reset_period = "quarterly"
+    elif re.search(r"\b(statement\s+(?:month|cycle)|billing\s+cycle)\b", corpus, re.I):
+        reset_period = "statement_cycle"
+
     return {
         "annual_fee": annual_fee,
         "rewards": rewards,
         "welcome_offer": welcome,
         "minimum_monthly_spend": min_spend,
+        "reset_period": reset_period,
         "cap_groups": cap_groups,
         "excluded_mccs": standard_mccs,
         "foreign_currency_fee_rate": "0.0325",

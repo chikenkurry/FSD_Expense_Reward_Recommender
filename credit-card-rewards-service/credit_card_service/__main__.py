@@ -20,7 +20,7 @@ def _parser() -> argparse.ArgumentParser:
     scrape = commands.add_parser("scrape"); scrape.add_argument("--config", required=True); scrape.add_argument("--db", required=True); scrape.add_argument("--source"); scrape.add_argument("--allow-private-hosts", action="store_true")
     export = commands.add_parser("export"); export.add_argument("--db", required=True); export.add_argument("--format", choices=("json", "csv"), default="json"); export.add_argument("--output")
     server = commands.add_parser("serve"); server.add_argument("--config", required=True); server.add_argument("--db", required=True); server.add_argument("--host", default="127.0.0.1"); server.add_argument("--port", type=int, default=8080); server.add_argument("--api-key"); server.add_argument("--admin-secret"); server.add_argument("--internal-secret"); server.add_argument("--allow-private-hosts", action="store_true")
-    worker = commands.add_parser("worker"); worker.add_argument("--db", required=True); worker.add_argument("--once", action="store_true"); worker.add_argument("--worker-id", default="local-worker")
+    worker = commands.add_parser("worker"); worker.add_argument("--db", required=True); worker.add_argument("--once", action="store_true"); worker.add_argument("--worker-id", default="local-worker"); worker.add_argument("--interval", type=int, default=0, help="Continuous worker polling interval in seconds (0 = run once)")
     seed = commands.add_parser("seed-demo"); seed.add_argument("--db", required=True); seed.add_argument("--rate", default="0.015")
     discover = commands.add_parser("discover"); discover.add_argument("--url", required=True); discover.add_argument("--issuer", default="Bank"); discover.add_argument("--pattern"); discover.add_argument("--output"); discover.add_argument("--scrape-db"); discover.add_argument("--allow-private-hosts", action="store_true")
     return parser
@@ -55,8 +55,42 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "seed-demo":
             print(json.dumps(db.seed_demo(args.db, args.rate), sort_keys=True)); return 0
         if args.command == "worker":
-            result = db.process_one(args.db, args.worker_id)
-            print(json.dumps({"status": "idle"} if result is None else result, sort_keys=True)); return 0
+            import signal
+            import time
+
+            interval = getattr(args, "interval", 0)
+            if args.once or interval <= 0:
+                result = db.process_one(args.db, args.worker_id)
+                print(json.dumps({"status": "idle"} if result is None else result, sort_keys=True))
+                return 0
+
+            stop_requested = False
+
+            def _sig_handler(signum, frame):
+                nonlocal stop_requested
+                stop_requested = True
+
+            signal.signal(signal.SIGINT, _sig_handler)
+            signal.signal(signal.SIGTERM, _sig_handler)
+
+            print(json.dumps({"event": "worker_started", "worker_id": args.worker_id, "interval_sec": interval}, sort_keys=True))
+            sys.stdout.flush()
+
+            while not stop_requested:
+                while not stop_requested:
+                    res = db.process_one(args.db, args.worker_id)
+                    if res is None:
+                        break
+                    print(json.dumps({"event": "task_completed", "worker_id": args.worker_id, "result": res}, sort_keys=True))
+                    sys.stdout.flush()
+
+                for _ in range(int(interval * 2)):
+                    if stop_requested:
+                        break
+                    time.sleep(0.5)
+
+            print(json.dumps({"event": "worker_stopped", "worker_id": args.worker_id}, sort_keys=True))
+            return 0
         if args.command == "discover":
             from .scraper import Scraper
             scraper = Scraper(allow_private_hosts=args.allow_private_hosts)

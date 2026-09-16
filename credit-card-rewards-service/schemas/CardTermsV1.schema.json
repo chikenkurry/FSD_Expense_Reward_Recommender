@@ -11,6 +11,7 @@
     "first_year_waiver": { "type": ["boolean", "string", "null"] },
     "foreign_currency_fee_rate": { "type": ["string", "null"], "pattern": "^[0-9]+(\\.[0-9]+)?$" },
     "minimum_monthly_spend": { "type": ["string", "null"], "pattern": "^[0-9]+(\\.[0-9]+)?$" },
+    "reset_period": { "type": ["string", "null"], "enum": ["calendar_month", "statement_cycle", "quarterly", null] },
     "excluded_mccs": { "type": "array", "items": { "type": "string" } },
     "cap_groups": {
       "type": "array",
@@ -21,7 +22,8 @@
           "cap_key": { "type": "string" },
           "mode": { "enum": ["limited", "unlimited", "unknown"] },
           "amount": { "type": ["string", "null"] },
-          "period": { "type": "string" }
+          "period": { "type": "string" },
+          "reset_period": { "type": ["string", "null"], "enum": ["calendar_month", "statement_cycle", "quarterly", null] }
         }
       }
     },
@@ -37,6 +39,7 @@
           "rate": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?$" },
           "reward_unit": { "type": "string" },
           "minimum_spend": { "type": ["string", "null"] },
+          "reset_period": { "type": ["string", "null"], "enum": ["calendar_month", "statement_cycle", "quarterly", null] },
           "cap_group_keys": { "type": "array", "items": { "type": "string" } },
           "excluded_mccs": { "type": "array", "items": { "type": "string" } }
         }

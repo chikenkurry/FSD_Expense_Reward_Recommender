@@ -887,6 +887,7 @@ def finish_success(path: str, run_id: int, record: dict) -> None:
                 "first_year_waiver": record.get("first_year_waiver", True if fee_amount == "0.00" else False),
                 "foreign_currency_fee_rate": record.get("foreign_currency_fee_rate", "0.0325"),
                 "minimum_monthly_spend": record.get("minimum_monthly_spend"),
+                "reset_period": record.get("reset_period", "calendar_month"),
                 "cap_groups": record.get("cap_groups", []),
                 "excluded_mccs": record.get("excluded_mccs", ["9399", "6540", "6300", "4900"]),
                 "rules": rules,
@@ -2030,6 +2031,7 @@ def simulate_card_rewards(card_detail: dict, monthly_spend: list[dict]) -> dict:
         "effective_reward_rate": effective_rate,
         "minimum_spend_met": min_spend_met,
         "minimum_monthly_spend": f"{min_spend:.2f}" if min_spend is not None else None,
+        "reset_period": terms.get("reset_period", "calendar_month"),
         "breakdown": breakdown,
     }
 

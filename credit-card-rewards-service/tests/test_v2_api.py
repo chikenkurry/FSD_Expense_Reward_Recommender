@@ -489,6 +489,110 @@ class V2ApiTests(unittest.TestCase):
         self.assertEqual(cursor_wrapper.fetchone(), {"col": "val"})
         self.assertEqual(len(cursor_wrapper.fetchall()), 1)
 
+    def test_reset_period_and_quarterly_rules(self):
+        """Verify extraction and simulation modeling for calendar_month, statement_cycle, and quarterly reset cycles."""
+        from credit_card_service.extract import extract
+
+        source = {
+            "source_id": "test-src",
+            "issuer": "UOB",
+            "name": "One Card",
+            "card_id": "uob-one",
+        }
+
+        # Text with quarterly language
+        quarterly_html = "<p>Earn up to 5% cashback each quarter with minimum qualifying spend of S$2,000 per month.</p>"
+        res_q = extract(source, quarterly_html)
+        self.assertEqual(res_q["reset_period"], "quarterly")
+
+        # Text with statement cycle language
+        statement_html = "<p>Rebates are calculated per billing cycle. Excludes insurance and tax payments.</p>"
+        res_s = extract(source, statement_html)
+        self.assertEqual(res_s["reset_period"], "statement_cycle")
+        self.assertIn("9399", res_s["excluded_mccs"])
+
+        # Simulation output carries reset_period
+        card_detail = {
+            "card": {"card_id": "c1", "name": "Card One", "reward_type": "cashback", "currency": "SGD"},
+            "terms": {
+                "minimum_monthly_spend": "500.00",
+                "reset_period": "quarterly",
+                "rules": [{"rule_key": "base", "rate": "0.015", "kind": "cashback", "reward_unit": "SGD", "match": {}}],
+            },
+        }
+        sim_res = db.simulate_card_rewards(card_detail, [{"amount": "600.00", "category": "dining"}])
+        self.assertEqual(sim_res["reset_period"], "quarterly")
+        self.assertTrue(sim_res["minimum_spend_met"])
+
+    def test_linked_pdf_terms_enrichment(self):
+        """Scraper automatically downloads linked T&C PDFs and extracts fine-print terms into facts."""
+        import zlib
+        from credit_card_service.scraper import Scraper
+
+        # Build valid PDF byte stream with FlateDecode text
+        text_stream = b"BT /F1 12 Tf 72 712 Td (Excluding tax payments and insurance) Tj ET"
+        compressed = zlib.compress(text_stream)
+        stream_len = len(compressed)
+        pdf_bytes = (
+            b"%PDF-1.4\n1 0 obj\n<< /Length " + str(stream_len).encode() + b" /Filter /FlateDecode >>\nstream\n"
+            + compressed
+            + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"
+        )
+
+        class MockEnrichedScraper(Scraper):
+            def _fetch(self, url, max_bytes=1000000, request_delay=0):
+                if url.endswith(".pdf"):
+                    return url, {"content-type": "application/pdf"}, pdf_bytes
+                html_body = """
+                <html><body>
+                    <h1>Bank Cashback Card</h1>
+                    <p>Earn 5% on dining.</p>
+                    <a href="http://example.com/card_tnc.pdf">Card Terms and Conditions</a>
+                </body></html>
+                """.encode("utf-8")
+                return url, {"content-type": "text/html"}, html_body
+
+            def _robots_allowed(self, page_url, request_delay):
+                return True
+
+        scraper = MockEnrichedScraper(allow_private_hosts=True)
+        # Create temp db
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+            tpath = f.name
+
+        try:
+            db.initialize(tpath)
+            res = scraper.scrape_source({
+                "source_id": "pdf-enriched-src",
+                "issuer": "DBS",
+                "name": "Live Fresh",
+                "card_id": "dbs-live-fresh",
+                "page_url": "http://example.com/card",
+                "extract_linked_pdfs": True,
+            }, tpath)
+            self.assertEqual(res["status"], "success")
+
+            candidates = db.candidate_list(tpath)
+            self.assertTrue(candidates)
+            candidate = candidates[0]
+            # The fine print from the PDF (tax payments 9399, insurance 6300) must be enriched
+            self.assertIn("9399", candidate["terms"]["excluded_mccs"])
+            self.assertIn("6300", candidate["terms"]["excluded_mccs"])
+        finally:
+            import os
+            if os.path.exists(tpath):
+                os.unlink(tpath)
+
+    def test_worker_cli_arguments_and_scheduler(self):
+        """Worker parser accepts --interval and validates continuous worker argument configuration."""
+        from credit_card_service.__main__ import _parser
+
+        parser = _parser()
+        args = parser.parse_args(["worker", "--db", "/data/test.sqlite", "--interval", "15", "--worker-id", "w1"])
+        self.assertEqual(args.interval, 15)
+        self.assertEqual(args.worker_id, "w1")
+        self.assertFalse(args.once)
+
 
 if __name__ == "__main__":
     unittest.main()

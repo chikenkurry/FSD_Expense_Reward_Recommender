@@ -21,7 +21,7 @@ MAX_RESPONSE_BYTES = 1_000_000
 MAX_REDIRECTS = 3
 
 SMART_EXCLUDE_TERMS = (
-    "login", "terms", "faq", "apply", "privacy", "contact", ".pdf",
+    "login", "faq", "apply", "privacy", "contact",
     "comparator", "compare", "checklist", "rates-fees", "fees", "announcements",
     "news", "promotion", "promotions", "deals", "offers", "services", "card-services",
     "credit-limit", "waive", "payment", "smart-pay", "bill", "alerts",
@@ -236,6 +236,24 @@ class Scraper:
 
         return results
 
+    def _fetch_rendered(self, url: str, source: dict) -> tuple[str, dict[str, str], bytes]:
+        """Fetch content, utilizing headless browser rendering if requires_js is set."""
+        if source.get("requires_js"):
+            try:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page(user_agent=USER_AGENT)
+                    page.goto(url, timeout=int(self.timeout * 1000), wait_until="networkidle")
+                    content = page.content()
+                    final_url = page.url
+                    browser.close()
+                    return final_url, {"content-type": "text/html; charset=utf-8", "x-rendered-by": "playwright"}, content.encode("utf-8")
+            except (ImportError, Exception):
+                pass
+        delay = float(source.get("request_delay_seconds", 0))
+        return self._fetch(url, request_delay=delay)
+
     def scrape_source(self, source: dict, db_path: str) -> dict:
         # Handle directory / hub crawling
         if source.get("is_directory"):
@@ -280,7 +298,7 @@ class Scraper:
             last_error = None
             for attempt in range(3):
                 try:
-                    final_url, headers, body = self._fetch(source["page_url"], request_delay=delay)
+                    final_url, headers, body = self._fetch_rendered(source["page_url"], source)
                     break
                 except ScrapeError as exc:
                     last_error = exc
@@ -298,7 +316,30 @@ class Scraper:
                 facts = extract(source, pdf_text)
             else:
                 html = body.decode("utf-8", errors="replace")
-                facts = extract(source, html)
+                combined_corpus = html
+                if source.get("extract_linked_pdfs", True):
+                    link_parser = _LinkExtractor(final_url)
+                    link_parser.feed(html)
+                    pdf_candidates = []
+                    for lk in link_parser.links:
+                        href_lower = lk["url"].lower()
+                        title_lower = (lk["title"] or "").lower()
+                        if href_lower.endswith(".pdf") or ".pdf?" in href_lower:
+                            if any(k in href_lower or k in title_lower for k in ("terms", "tnc", "condition", "agreement", "pricing", "benefit", "rates", "fee")):
+                                pdf_candidates.append(lk["url"])
+                                if len(pdf_candidates) >= 2:
+                                    break
+                    for pdf_url in pdf_candidates:
+                        try:
+                            _, p_hdrs, p_body = self._fetch(pdf_url, max_bytes=MAX_RESPONSE_BYTES, request_delay=delay)
+                            if p_body.startswith(b"%PDF") or "pdf" in (p_hdrs.get("content-type") or ""):
+                                from .extract import extract_pdf_text
+                                p_text = extract_pdf_text(p_body)
+                                if p_text.strip():
+                                    combined_corpus += f"\n\n--- EXTRACTED PDF TERMS ({pdf_url}) ---\n{p_text}"
+                        except Exception:
+                            pass
+                facts = extract(source, combined_corpus)
             record = {"card_id": source["card_id"], "issuer": source["issuer"], "name": source["name"], "source_url": final_url,
                 **facts, "provenance": {"source_id": source["source_id"], "fetched_at": utc_now(), "content_sha256": hashlib.sha256(body).hexdigest(), "parser_version": PARSER_VERSION},
                 "status": "success", "error": None}
