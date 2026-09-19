@@ -21,6 +21,7 @@ Processes a batch of raw transactions. The engine first checks the internal dete
 | `transactions[].transaction_id` | `UUID` | Yes | The ID of the transaction from the Tracking service. |
 | `transactions[].merchant_name` | `String` | Yes | Cleaned merchant name to be evaluated. |
 | `transactions[].amount` | `Decimal` | Yes | Transaction amount (used by LLM for disambiguation). |
+| `transactions[].currency` | `String` | Yes | ISO 4217 currency code for the transaction. For the current project scope this will usually be `"SGD"`. |
 | `transactions[].raw_description` | `String` | No | Original raw string, used as fallback context if needed. |
 
 **Example Request:**
@@ -31,12 +32,14 @@ Processes a batch of raw transactions. The engine first checks the internal dete
       "transaction_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
       "merchant_name": "NETFLIX PTE LTD",
       "amount": -15.99,
+      "currency": "SGD",
       "raw_description": "VISA POS DEBIT NETFLIX PTE LTD SG"
     },
     {
       "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
       "merchant_name": "NTUC FAIRPRICE",
       "amount": -45.50,
+      "currency": "SGD",
       "raw_description": "NTUC FAIRPRICE JURONG EAST"
     }
   ]
@@ -52,7 +55,7 @@ Processes a batch of raw transactions. The engine first checks the internal dete
 | `results[].transaction_id` | `UUID` | Mapped directly back to the requested transaction ID. |
 | `results[].predicted_category` | `String` | The assigned category (or `"Uncategorized"` if unknown). |
 | `results[].confidence_score` | `Number` | `1.0` if resolved by Cache, `0.1-0.99` if resolved by LLM. |
-| `results[].source` | `String` | `"cache"` or `"llm"`. Useful for monitoring metrics. |
+| `results[].source` | `String` | `"cache"`, `"llm"`, or `"fallback"`. Useful for monitoring metrics. |
 | `results[].reasoning` | `String` | Explanation provided by the LLM (null if resolved by cache). |
 
 **Example Response:**
@@ -97,7 +100,7 @@ Called asynchronously by the Expense Tracking Service whenever a user manually c
 ```json
 {
   "merchant_name": "7-ELEVEN SG",
-  "category_final": "Food & Beverage",
+  "category_final": "Dining",
   "override_previous": true
 }
 ```

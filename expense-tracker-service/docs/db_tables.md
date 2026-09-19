@@ -24,3 +24,19 @@ Transaction table
 | transaction_date | Timestamp / Datetime | transaction date                                     |
 | dedupe_hash      | String / VARCHAR     | dedupe hash generated on import. prevents same entry |
 | created_at       | Timestamp / Datetime | the date and time transaction was added              |
+
+Categorisation enum
+
+The `categorisation` column must use the same category enum as the Auto-Categorization Service:
+
+| Value           | Description                                                                 |
+| --------------- | --------------------------------------------------------------------------- |
+| Dining          | Restaurants, cafes, takeaway, and food vendors that are not grocery stores  |
+| Groceries       | Supermarkets, wet markets, and grocery stores                               |
+| Transport       | Public transport, taxis, ride-hailing, parking, fuel, and travel movement   |
+| Shopping        | Retail purchases and general merchandise                                    |
+| Utilities       | Electricity, water, telco, internet, and other recurring household bills    |
+| Subscriptions   | Recurring digital services, memberships, and subscription products          |
+| Entertainment   | Movies, games, events, attractions, and leisure activities                  |
+| Income          | Salary, refunds, rebates, transfers in, and other positive inflows          |
+| Uncategorized   | Used when the category cannot be confidently determined                     |
