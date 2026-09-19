@@ -1,0 +1,16 @@
+[project]
+name = "expense-categorisation-engine-service"
+version = "0.1.0"
+description = "Standalone transaction categorisation microservice"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "pydantic-settings>=2.6,<3.0",
+]
+
+[project.scripts]
+categorisation-service = "app.main:run"
+
+[tool.uvicorn]
+factory = true
