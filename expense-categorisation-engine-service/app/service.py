@@ -1,4 +1,5 @@
 from app.llm import LLMProvider
+from app.merchant import normalize_merchant_name
 from app.models import BatchRequest, BatchResponse, Category, CategorisationResult, FeedbackRequest, FeedbackResponse
 from app.repository import CacheRepository
 
@@ -12,7 +13,8 @@ class CategorisationService:
         results: list[CategorisationResult] = []
         misses = []
         for transaction in request.transactions:
-            cached = self.cache.find(transaction.merchant_name)
+            normalized_name = normalize_merchant_name(transaction.merchant_name)
+            cached = self.cache.find(normalized_name)
             if cached:
                 results.append(CategorisationResult(
                     transaction_id=transaction.transaction_id,
@@ -21,7 +23,7 @@ class CategorisationService:
                     source="cache",
                 ))
             else:
-                misses.append(transaction)
+                misses.append(transaction.model_copy(update={"merchant_name": normalized_name}))
 
         if misses:
             try:
@@ -42,6 +44,7 @@ class CategorisationService:
         return BatchResponse(results=[by_id[str(item.transaction_id)] for item in request.transactions])
 
     def record_feedback(self, request: FeedbackRequest) -> FeedbackResponse:
-        updated = self.cache.upsert(request.merchant_name, request.category_final, request.override_previous)
-        message = f"Cache rule successfully updated for {request.merchant_name}" if updated else "Existing cache rule preserved"
+        normalized_name = normalize_merchant_name(request.merchant_name)
+        updated = self.cache.upsert(normalized_name, request.category_final, request.override_previous)
+        message = f"Cache rule successfully updated for {normalized_name}" if updated else "Existing cache rule preserved"
         return FeedbackResponse(success=True, cache_updated=updated, message=message)

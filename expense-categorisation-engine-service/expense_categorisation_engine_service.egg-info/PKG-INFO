@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: expense-categorisation-engine-service
+Version: 0.1.0
+Summary: Standalone transaction categorisation microservice
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Requires-Dist: pydantic-settings<3.0,>=2.6
+Provides-Extra: openai
+Requires-Dist: openai<2.0,>=1.60; extra == "openai"
+Provides-Extra: gemini
+Requires-Dist: google-genai<2.0,>=1.0; extra == "gemini"
