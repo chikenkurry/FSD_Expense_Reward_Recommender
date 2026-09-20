@@ -21,3 +21,7 @@ The default `LLM_PROVIDER=none` is intentional: cache misses return
 Merchant names are normalized before cache lookup and feedback storage by
 trimming whitespace, collapsing repeated whitespace, applying Unicode
 normalization, and converting to uppercase.
+
+Transient LLM failures are retried with exponential backoff and jitter. The
+default is three retries with a one-second base delay. Permanent errors and
+invalid structured output are not retried and use the fallback response.

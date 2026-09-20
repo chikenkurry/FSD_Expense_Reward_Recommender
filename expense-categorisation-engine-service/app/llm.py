@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import random
+import time
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +17,36 @@ class LLMClassification:
 
 class LLMProvider(Protocol):
     def classify(self, transactions: list[CategorisationTransaction]) -> dict[str, LLMClassification]: ...
+
+
+def _is_transient_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+
+    status_code = getattr(error, "status_code", None)
+    if status_code is None:
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+    return status_code == 429 or status_code in {500, 502, 503, 504}
+
+
+class RetryingLLMProvider:
+    def __init__(self, provider: LLMProvider, max_retries: int, base_delay_seconds: float) -> None:
+        self.provider = provider
+        self.max_retries = max(0, max_retries)
+        self.base_delay_seconds = max(0.0, base_delay_seconds)
+
+    def classify(self, transactions: list[CategorisationTransaction]) -> dict[str, LLMClassification]:
+        for attempt in range(self.max_retries + 1):
+            try:
+                return self.provider.classify(transactions)
+            except Exception as error:
+                if not _is_transient_error(error) or attempt == self.max_retries:
+                    raise
+                delay = self.base_delay_seconds * (2**attempt)
+                delay += random.uniform(0, self.base_delay_seconds * 0.25)
+                time.sleep(delay)
+        raise RuntimeError("LLM retry loop exited unexpectedly")
 
 
 class LLMClassificationOutput(BaseModel):

@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 
 from app.config import get_settings
-from app.llm import GeminiProvider, OpenAIProvider, UnconfiguredLLMProvider
+from app.llm import GeminiProvider, OpenAIProvider, RetryingLLMProvider, UnconfiguredLLMProvider
 from app.models import BatchRequest, BatchResponse, FeedbackRequest, FeedbackResponse
 from app.repository import CacheRepository
 from app.service import CategorisationService
@@ -9,7 +9,11 @@ from app.service import CategorisationService
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    llm = _build_llm_provider(settings)
+    llm = RetryingLLMProvider(
+        provider=_build_llm_provider(settings),
+        max_retries=settings.llm_max_retries,
+        base_delay_seconds=settings.llm_retry_base_delay_seconds,
+    )
     service = CategorisationService(
         cache=CacheRepository(settings.database_path),
         llm=llm,

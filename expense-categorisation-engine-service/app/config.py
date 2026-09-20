@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_timeout_seconds: float = 10.0
     llm_max_retries: int = 3
+    llm_retry_base_delay_seconds: float = 1.0
 
     model_config = SettingsConfigDict(env_file=".env", env_prefix="", extra="ignore")
 
