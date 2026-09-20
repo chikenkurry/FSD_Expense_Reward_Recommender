@@ -9,8 +9,15 @@ dependencies = [
     "pydantic-settings>=2.6,<3.0",
 ]
 
+[project.optional-dependencies]
+openai = ["openai>=1.60,<2.0"]
+gemini = ["google-genai>=1.0,<2.0"]
+
 [project.scripts]
 categorisation-service = "app.main:run"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.uvicorn]
 factory = true
