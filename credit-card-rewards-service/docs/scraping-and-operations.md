@@ -1,7 +1,0 @@
-# Scraping, safety, and operations
-
-Use official APIs, issuer feeds, or written permission when available. Before enabling a source, review the site's robots.txt and terms, set an appropriate delay, and keep contact details in an operator-controlled deployment user agent policy. Do not use this project for CAPTCHA bypass, stealth, proxy rotation, authentication bypass, or anti-bot evasion.
-
-Only HTTP(S) URLs from config can run. The scraper uses a descriptive User-Agent, 10-second timeout, 1 MB body cap, three controlled redirects, HTML content-type validation, robots.txt, and up to three transient retries with bounded backoff. The configured per-host delay is applied between every outbound request to that host, including robots, redirects, and retries. By default it rejects loopback, private, link-local, unspecified, reserved, and other non-global DNS answers. Redirect destinations are checked again. `--allow-private-hosts` prints a warning and exists only for trusted local testing/development.
-
-Pages can change structure, use client-side rendering, omit content, throttle, or prohibit automated access. Generic HTML/JSON-LD patterns intentionally recognize only common cashback, points/miles, annual-fee, and welcome-offer phrasing; they cannot establish correctness. Inspect each bounded evidence snippet, content hash, timestamp, and scrape-run error before publishing data. Failed fetches do not overwrite last good cards. Back up the SQLite file to retain the append-only audit history.
